@@ -236,7 +236,7 @@ page = st.sidebar.radio("Go to", ["1. Setup", "2. Daily Entry", "3. Order Report
 # PAGE 1 — SETUP: add your own ingredients, dishes, recipes, or bulk import
 # =============================================================================
 if page == "1. Setup":
-    tab_ing, tab_dish, tab_import = st.tabs(["Ingredients", "Dishes", "Import from CSV"])
+    tab_ing, tab_dish, tab_import = st.tabs(["Ingredients", "Dishes", "Import / Export CSV"])
 
     # --- Ingredients tab ---
     with tab_ing:
@@ -457,9 +457,50 @@ if page == "1. Setup":
 
     # --- Import tab: bulk-add ingredients and recipes via CSV ---
     with tab_import:
-        st.subheader("Bulk import ingredients")
+        st.subheader("Export current data")
+        st.caption("Download your current ingredients (with current stock levels) and recipes. "
+                   "After a delivery, edit the stock numbers in this file and re-upload it below — "
+                   "matching ingredients get updated in place, nothing gets duplicated.")
+
+        exp_col1, exp_col2 = st.columns(2)
+        with exp_col1:
+            export_ingredients = db.list_ingredients(LOCATION_ID)
+            if export_ingredients:
+                export_ing_df = pd.DataFrame([{
+                    "name": i["name"], "unit": i["unit"], "current_stock": i["current_stock"],
+                    "reorder_threshold": i["reorder_threshold"], "par_level": i["par_level"],
+                    "supplier": i["supplier"] or "",
+                } for i in export_ingredients])
+                st.download_button(
+                    "⬇️ Export ingredients", export_ing_df.to_csv(index=False),
+                    file_name="ingredients_export.csv", key="export_ing_btn",
+                )
+            else:
+                st.caption("No ingredients yet to export.")
+
+        with exp_col2:
+            export_dishes = db.list_dishes(LOCATION_ID)
+            recipe_rows = []
+            for d in export_dishes:
+                for item in db.get_recipe_for_dish(d["id"]):
+                    recipe_rows.append({
+                        "dish": d["name"], "ingredient": item["ingredient_name"],
+                        "qty_per_dish": item["qty_per_dish"],
+                    })
+            if recipe_rows:
+                export_recipe_df = pd.DataFrame(recipe_rows)
+                st.download_button(
+                    "⬇️ Export recipes", export_recipe_df.to_csv(index=False),
+                    file_name="recipes_export.csv", key="export_recipe_btn",
+                )
+            else:
+                st.caption("No recipes yet to export.")
+
+        st.divider()
+        st.subheader("Import / update ingredients")
         st.caption("CSV columns: name, unit, current_stock, reorder_threshold, par_level, supplier "
-                   "(current_stock/reorder_threshold/par_level/supplier are optional, default to 0/empty)")
+                   "(current_stock/reorder_threshold/par_level/supplier are optional, default to 0/empty). "
+                   "If an ingredient name already exists, its values are updated — nothing is duplicated.")
 
         sample_ing_csv = "name,unit,current_stock,reorder_threshold,par_level,supplier\nMozzarella,kg,5,3,10,Metro\nTomato Sauce,l,8,4,15,Metro\n"
         st.download_button("Download template", sample_ing_csv, file_name="ingredients_template.csv")
@@ -473,24 +514,32 @@ if page == "1. Setup":
                     st.error("CSV must have at least 'name' and 'unit' columns.")
                 else:
                     if st.button("Import ingredients"):
-                        added, skipped = 0, 0
+                        added, updated = 0, 0
                         for _, row in df.iterrows():
                             name = str(row["name"]).strip()
                             if not name or pd.isna(row["name"]):
                                 continue
+                            unit = str(row.get("unit", "pcs")).strip()
+                            current_stock = float(row.get("current_stock", 0) or 0)
+                            reorder_threshold = float(row.get("reorder_threshold", 0) or 0)
+                            par_level = float(row.get("par_level", 0) or 0)
+                            supplier = str(row.get("supplier", "") or "")
+
                             existing = db.find_ingredient_by_name(LOCATION_ID, name)
                             if existing:
-                                skipped += 1
-                                continue
-                            db.add_ingredient(
-                                LOCATION_ID, name, str(row.get("unit", "pcs")).strip(),
-                                float(row.get("current_stock", 0) or 0),
-                                float(row.get("reorder_threshold", 0) or 0),
-                                float(row.get("par_level", 0) or 0),
-                                str(row.get("supplier", "") or ""),
-                            )
-                            added += 1
-                        st.success(f"Imported {added} ingredient(s). Skipped {skipped} that already existed.")
+                                db.update_ingredient(
+                                    existing["id"], unit=unit, current_stock=current_stock,
+                                    reorder_threshold=reorder_threshold, par_level=par_level,
+                                    supplier=supplier,
+                                )
+                                updated += 1
+                            else:
+                                db.add_ingredient(
+                                    LOCATION_ID, name, unit, current_stock,
+                                    reorder_threshold, par_level, supplier,
+                                )
+                                added += 1
+                        st.success(f"Added {added} new ingredient(s), updated {updated} existing one(s).")
                         st.rerun()
             except Exception as e:
                 st.error(f"Couldn't read that CSV: {e}")
