@@ -1,0 +1,24 @@
+name: Daily Report Email
+
+on:
+  schedule:
+    # Runs at 22:00 UTC every day — adjust the hour for your timezone (see README)
+    - cron: '0 22 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install psycopg2-binary requests
+      - name: Send daily report
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          REPORT_EMAIL_TO: ${{ secrets.REPORT_EMAIL_TO }}
+        run: python scheduled_report.py
