@@ -18,6 +18,7 @@ the sidebar.
 """
 import streamlit as st
 import pandas as pd
+import io
 from datetime import date
 import db
 import daily_report
@@ -230,7 +231,7 @@ with st.sidebar.expander("Manage locations"):
     else:
         st.caption("Can't delete your only location.")
 
-page = st.sidebar.radio("Go to", ["1. Setup", "2. Daily Entry", "3. Order Report", "4. History"])
+page = st.sidebar.radio("Go to", ["1. Setup", "2. Daily Entry", "3. Order Report", "4. History", "5. Activity Log"])
 
 # =============================================================================
 # PAGE 1 — SETUP: add your own ingredients, dishes, recipes, or bulk import
@@ -256,6 +257,7 @@ if page == "1. Setup":
                     st.error("Name is required.")
                 else:
                     db.add_ingredient(LOCATION_ID, name, unit, current_stock, reorder_threshold, par_level, supplier)
+                    db.log_activity(LOCATION_ID, "Added ingredient", f"{name} ({unit})")
                     st.success(f"Added '{name}'")
                     st.rerun()
 
@@ -281,16 +283,20 @@ if page == "1. Setup":
             duplicate_clicked = bar4.button("⧉ Duplicate", key="dup_sel_ing", disabled=selected_count == 0)
 
             if duplicate_clicked:
+                dup_names = [ing['name'] for ing in ingredients if ing['id'] in st.session_state.selected_ingredients]
                 for ing_id in st.session_state.selected_ingredients:
                     db.duplicate_ingredient(ing_id)
+                db.log_activity(LOCATION_ID, f"Duplicated {selected_count} ingredient(s)", ", ".join(dup_names))
                 st.session_state.selected_ingredients = set()
                 st.success(f"Duplicated {selected_count} ingredient(s).")
                 st.rerun()
 
             if selected_count > 0:
                 def _bulk_delete_ingredients():
+                    del_names = [ing['name'] for ing in ingredients if ing['id'] in st.session_state.selected_ingredients]
                     for ing_id in list(st.session_state.selected_ingredients):
                         db.delete_ingredient(ing_id)
+                    db.log_activity(LOCATION_ID, f"Deleted {len(del_names)} ingredient(s)", ", ".join(del_names))
                     st.session_state.selected_ingredients = set()
 
                 confirm_delete(
@@ -342,13 +348,17 @@ if page == "1. Setup":
                             current_stock=edit_stock, reorder_threshold=edit_threshold,
                             par_level=edit_par, supplier=edit_supplier,
                         )
+                        db.log_activity(LOCATION_ID, "Edited ingredient", f"{ing['name']} → {edit_name}")
                         st.success("Saved")
                         st.rerun()
 
                     st.divider()
                     confirm_delete(
                         f"ing_{ing['id']}", ing['name'],
-                        lambda ing_id=ing['id']: db.delete_ingredient(ing_id),
+                        lambda ing_id=ing['id'], ing_name=ing['name']: (
+                            db.delete_ingredient(ing_id),
+                            db.log_activity(LOCATION_ID, "Deleted ingredient", ing_name),
+                        ),
                     )
 
     # --- Dishes tab: add dishes, and manage each dish's ingredient list inline ---
@@ -362,6 +372,7 @@ if page == "1. Setup":
                     st.error("Name is required.")
                 else:
                     db.add_dish(LOCATION_ID, dish_name)
+                    db.log_activity(LOCATION_ID, "Added dish", dish_name)
                     st.success(f"Added '{dish_name}'")
                     st.rerun()
 
@@ -389,6 +400,7 @@ if page == "1. Setup":
                     if rn2.button("💾 Save name", key=f"savename_{d['id']}"):
                         if edit_dish_name.strip():
                             db.update_dish(d['id'], edit_dish_name.strip())
+                            db.log_activity(LOCATION_ID, "Renamed dish", f"{d['name']} → {edit_dish_name.strip()}")
                             st.success("Renamed")
                             st.rerun()
                         else:
@@ -413,13 +425,17 @@ if page == "1. Setup":
                                 )
                                 if st.button("💾 Save changes", key=f"esaverec_{d['id']}_{item['ingredient_id']}"):
                                     db.upsert_recipe_item(d['id'], item['ingredient_id'], new_qty)
+                                    db.log_activity(LOCATION_ID, "Edited recipe", f"{d['name']}: {item['ingredient_name']} → {new_qty} {item['unit']}")
                                     st.success("Saved")
                                     st.rerun()
 
                                 st.divider()
                                 confirm_delete(
                                     f"recipe_{d['id']}_{item['ingredient_id']}", item['ingredient_name'],
-                                    lambda did=d['id'], iid=item['ingredient_id']: db.remove_recipe_item(did, iid),
+                                    lambda did=d['id'], iid=item['ingredient_id'], dname=d['name'], iname=item['ingredient_name']: (
+                                        db.remove_recipe_item(did, iid),
+                                        db.log_activity(LOCATION_ID, "Removed ingredient from recipe", f"{dname}: {iname}"),
+                                    ),
                                 )
                     else:
                         st.caption("No ingredients added to this dish yet.")
@@ -445,6 +461,7 @@ if page == "1. Setup":
                         if ac3.button("Add", key=f"addbtn_{d['id']}"):
                             if add_qty > 0:
                                 db.upsert_recipe_item(d['id'], pick['id'], add_qty)
+                                db.log_activity(LOCATION_ID, "Added ingredient to recipe", f"{d['name']}: {pick_name} ({add_qty} {pick['unit']})")
                                 st.rerun()
                             else:
                                 st.error("Enter an amount greater than 0.")
@@ -452,7 +469,10 @@ if page == "1. Setup":
                     st.divider()
                     confirm_delete(
                         f"dish_{d['id']}", d['name'],
-                        lambda did=d['id']: db.delete_dish(did),
+                        lambda did=d['id'], dname=d['name']: (
+                            db.delete_dish(did),
+                            db.log_activity(LOCATION_ID, "Deleted dish", dname),
+                        ),
                     )
 
     # --- Import tab: bulk-add ingredients and recipes via CSV ---
@@ -474,6 +494,7 @@ if page == "1. Setup":
                 st.download_button(
                     "⬇️ Export ingredients", export_ing_df.to_csv(index=False),
                     file_name="ingredients_export.csv", key="export_ing_btn",
+                    on_click=lambda: db.log_activity(LOCATION_ID, "Exported ingredients CSV", f"{len(export_ingredients)} ingredient(s)", snapshot=False),
                 )
             else:
                 st.caption("No ingredients yet to export.")
@@ -492,6 +513,7 @@ if page == "1. Setup":
                 st.download_button(
                     "⬇️ Export recipes", export_recipe_df.to_csv(index=False),
                     file_name="recipes_export.csv", key="export_recipe_btn",
+                    on_click=lambda: db.log_activity(LOCATION_ID, "Exported recipes CSV", f"{len(recipe_rows)} recipe line(s)", snapshot=False),
                 )
             else:
                 st.caption("No recipes yet to export.")
@@ -540,6 +562,10 @@ if page == "1. Setup":
                                 )
                                 added += 1
                         st.success(f"Added {added} new ingredient(s), updated {updated} existing one(s).")
+                        db.log_activity(
+                            LOCATION_ID, "Uploaded ingredients CSV",
+                            f"{ing_file.name}: added {added}, updated {updated}",
+                        )
                         st.rerun()
             except Exception as e:
                 st.error(f"Couldn't read that CSV: {e}")
@@ -581,6 +607,7 @@ if page == "1. Setup":
                             db.upsert_recipe_item(dish_id, ing["id"], float(qty))
                             added += 1
                         st.success(f"Imported {added} recipe line(s).")
+                        db.log_activity(LOCATION_ID, "Uploaded recipes CSV", f"{recipe_file.name}: {added} line(s)")
                         if errors:
                             st.warning("\n".join(errors))
                         st.rerun()
@@ -617,6 +644,10 @@ elif page == "2. Daily Entry":
                     db.record_sales(LOCATION_ID, date_str, sales)
                     usage = db.calculate_usage_for_date(LOCATION_ID, date_str)
                     db.apply_usage_to_stock(LOCATION_ID, usage)
+                    db.log_activity(
+                        LOCATION_ID, "Recorded sales (manual)",
+                        f"{date_str}: " + ", ".join(f"{k}×{v}" for k, v in sales.items()),
+                    )
                     st.success("Sales recorded and stock updated!")
                     st.write("**Ingredients used today:**")
                     for ing_name, qty in usage.items():
@@ -669,6 +700,10 @@ elif page == "2. Daily Entry":
                                     db.record_sales(LOCATION_ID, row_date, day_sales)
                                     usage = db.calculate_usage_for_date(LOCATION_ID, row_date)
                                     db.apply_usage_to_stock(LOCATION_ID, usage)
+                                db.log_activity(
+                                    LOCATION_ID, "Uploaded sales CSV",
+                                    f"{sales_csv_file.name}: {len(by_date)} date(s)",
+                                )
                                 st.success(f"Recorded sales for {len(by_date)} date(s) and updated stock!")
                                 st.rerun()
                 except Exception as e:
@@ -724,6 +759,7 @@ elif page == "3. Order Report":
                     adjust_qty = c2.number_input("Quantity received (or negative to subtract)", step=0.1)
                     if st.button("Apply adjustment", type="primary"):
                         db.receive_delivery(LOCATION_ID, {ing_name: adjust_qty})
+                        db.log_activity(LOCATION_ID, "Manual stock adjustment", f"{ing_name}: {adjust_qty:+}")
                         st.success(f"Updated stock for {ing_name}")
                         st.rerun()
 
@@ -765,6 +801,10 @@ elif page == "3. Order Report":
                                     st.warning("No valid rows to add.")
                                 else:
                                     db.receive_delivery(LOCATION_ID, deliveries)
+                                    db.log_activity(
+                                        LOCATION_ID, "Uploaded order manifest CSV",
+                                        f"{manifest_csv_file.name}: {len(deliveries)} item(s)",
+                                    )
                                     st.success(f"Added {len(deliveries)} item(s) to stock!")
                                     st.rerun()
                     except Exception as e:
@@ -780,6 +820,7 @@ elif page == "3. Order Report":
                     resend_api_key = st.secrets["RESEND_API_KEY"]
                     subject, text_body, html_body = daily_report.build_report(LOCATION_ID, selected_location_name)
                     daily_report.send_email(subject, text_body, html_body, to_addr, resend_api_key)
+                    db.log_activity(LOCATION_ID, "Sent email report", f"to {to_addr}", snapshot=False)
                     st.success(f"Report sent to {to_addr}!")
                 except KeyError:
                     st.error("Email isn't set up yet. Add REPORT_EMAIL_TO and RESEND_API_KEY "
@@ -827,3 +868,91 @@ elif page == "4. History":
                 st.caption("Pick at least one dish above to see its sales trend.")
         else:
             st.caption("No dish sales recorded in this period.")
+
+# =============================================================================
+# PAGE 5 — ACTIVITY LOG: every change made in the app, most recent first
+# =============================================================================
+elif page == "5. Activity Log":
+    st.markdown('<h2 style="margin-bottom:0.2rem;">Activity log</h2>', unsafe_allow_html=True)
+    st.caption(f"Every change made for {selected_location_name} — ingredients, recipes, sales, deliveries, "
+               f"CSV uploads/downloads, and email reports.")
+
+    tab_log, tab_versions = st.tabs(["Log", "Download past versions"])
+
+    with tab_versions:
+        st.caption("Every change saves a version of your ingredient and recipe lists. "
+                   "Pick any point in time below to download exactly how the list looked then.")
+
+        vtype = st.radio("Which list?", ["ingredients", "recipes"], horizontal=True, key="version_type")
+        snapshots = db.list_snapshots(LOCATION_ID, vtype, limit=100)
+
+        if not snapshots:
+            st.info("No saved versions yet — they start being recorded from your next change onward.")
+        else:
+            def _version_label(idx: int, snap: dict) -> str:
+                when = snap["created_at"].strftime("%Y-%m-%d %H:%M")
+                if idx == 0:
+                    position = "Current"
+                elif idx == 1:
+                    position = "Previous"
+                else:
+                    position = f"{idx} changes ago"
+                return f"{position} — {when} — {snap['reason'] or 'change'}"
+
+            options = {_version_label(i, s): s["id"] for i, s in enumerate(snapshots)}
+            picked_label = st.selectbox("Version", list(options.keys()), key="version_pick")
+            picked_id = options[picked_label]
+            content = db.get_snapshot_content(picked_id)
+
+            if content:
+                try:
+                    preview_df = pd.read_csv(io.StringIO(content))
+                    st.caption(f"{len(preview_df)} row(s) in this version")
+                    st.dataframe(preview_df, use_container_width=True, height=300)
+                except Exception:
+                    st.text(content[:2000])
+
+                picked_snap = next(s for s in snapshots if s["id"] == picked_id)
+                stamp = picked_snap["created_at"].strftime("%Y%m%d_%H%M")
+                st.download_button(
+                    f"⬇️ Download this {vtype} version",
+                    content,
+                    file_name=f"{vtype}_{stamp}.csv",
+                    key="download_version_btn",
+                )
+                st.caption("This file uses the same format as the importer — you can re-upload it "
+                           "on the Setup page to roll back to this version.")
+
+    with tab_log:
+        limit = st.slider("Show last N entries", min_value=25, max_value=500, value=100, step=25)
+        log_entries = db.get_activity_log(LOCATION_ID, limit=limit)
+
+        if not log_entries:
+            st.info("No activity recorded yet — actions you take around the app will show up here.")
+        else:
+            action_types = sorted({e["action"] for e in log_entries})
+            picked_actions = st.multiselect("Filter by action type", action_types, default=[])
+            filtered_entries = [e for e in log_entries if not picked_actions or e["action"] in picked_actions]
+
+            st.caption(f"Showing {len(filtered_entries)} of {len(log_entries)} entries")
+
+            for entry in filtered_entries:
+                with st.container(border=True):
+                    c1, c2 = st.columns([1, 3])
+                    with c1:
+                        st.markdown(
+                            f'<span class="kt-mono" style="font-size:0.8rem; color:var(--ink-soft);">'
+                            f'{entry["created_at"].strftime("%Y-%m-%d %H:%M")}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    with c2:
+                        st.markdown(f"**{entry['action']}**", unsafe_allow_html=True)
+                        if entry["details"]:
+                            st.caption(entry["details"])
+
+            log_df = pd.DataFrame(filtered_entries)
+            if not log_df.empty:
+                st.download_button(
+                    "⬇️ Export activity log as CSV", log_df.to_csv(index=False),
+                    file_name="activity_log_export.csv",
+                )

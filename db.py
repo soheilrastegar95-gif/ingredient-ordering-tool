@@ -382,6 +382,127 @@ def get_dish_sales_for_date(location_id: int, date: str) -> dict[str, int]:
     return {row["dish"]: int(row["qty_sold"]) for row in rows}
 
 
+def _build_ingredients_csv(location_id: int) -> str:
+    """Current ingredients as CSV text — same columns as the export/import format."""
+    import csv, io
+    rows = list_ingredients(location_id)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["name", "unit", "current_stock", "reorder_threshold", "par_level", "supplier"])
+    for r in rows:
+        writer.writerow([
+            r["name"], r["unit"], r["current_stock"],
+            r["reorder_threshold"], r["par_level"], r["supplier"] or "",
+        ])
+    return buf.getvalue()
+
+
+def _build_recipes_csv(location_id: int) -> str:
+    """Current recipes as CSV text — same columns as the export/import format."""
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["dish", "ingredient", "qty_per_dish"])
+    for d in list_dishes(location_id):
+        for item in get_recipe_for_dish(d["id"]):
+            writer.writerow([d["name"], item["ingredient_name"], item["qty_per_dish"]])
+    return buf.getvalue()
+
+
+def _latest_snapshot_content(location_id: int, snapshot_type: str) -> str | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT content FROM data_snapshots WHERE location_id = %s AND snapshot_type = %s "
+        "ORDER BY created_at DESC LIMIT 1",
+        (location_id, snapshot_type),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["content"] if row else None
+
+
+def save_snapshots(location_id: int, reason: str):
+    """
+    Stores the current ingredients and recipes as retrievable versions.
+    Skips writing when the content is identical to the most recent snapshot,
+    so the version list only contains points where something actually changed.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    for snapshot_type, content in (
+        ("ingredients", _build_ingredients_csv(location_id)),
+        ("recipes", _build_recipes_csv(location_id)),
+    ):
+        if content == _latest_snapshot_content(location_id, snapshot_type):
+            continue
+        cur.execute(
+            "INSERT INTO data_snapshots (location_id, snapshot_type, content, reason) "
+            "VALUES (%s, %s, %s, %s)",
+            (location_id, snapshot_type, content, reason),
+        )
+    conn.commit()
+    conn.close()
+
+
+def list_snapshots(location_id: int, snapshot_type: str, limit: int = 50) -> list[dict]:
+    """Returns saved versions, most recent first."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, reason, created_at FROM data_snapshots "
+        "WHERE location_id = %s AND snapshot_type = %s ORDER BY created_at DESC LIMIT %s",
+        (location_id, snapshot_type, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_snapshot_content(snapshot_id: int) -> str | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT content FROM data_snapshots WHERE id = %s", (snapshot_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["content"] if row else None
+
+
+def log_activity(location_id: int, action: str, details: str = "", snapshot: bool = True):
+    """
+    Records one entry in the activity log — call this after any change the user makes.
+    When snapshot=True (the default), also stores the resulting ingredient and recipe
+    lists so that version can be downloaded later. Pass snapshot=False for actions
+    that don't change data (exports, sending an email).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO activity_log (location_id, action, details) VALUES (%s, %s, %s)",
+        (location_id, action, details),
+    )
+    conn.commit()
+    conn.close()
+
+    if snapshot:
+        label = f"{action}: {details}" if details else action
+        save_snapshots(location_id, label)
+
+
+def get_activity_log(location_id: int, limit: int = 300) -> list[dict]:
+    """Returns recent activity log entries, most recent first."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT action, details, created_at FROM activity_log WHERE location_id = %s "
+        "ORDER BY created_at DESC LIMIT %s",
+        (location_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_order_report(location_id: int) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()

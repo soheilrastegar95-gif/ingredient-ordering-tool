@@ -21,12 +21,33 @@ def run(cmd):
         sys.exit(result.returncode)
 
 
+def push():
+    print("$ git push")
+    result = subprocess.run(["git", "push"], capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout)
+    if result.returncode != 0:
+        # Likely the very first push — no upstream branch set yet
+        print(result.stderr)
+        print("Retrying with upstream set (first push)...")
+        run(["git", "push", "-u", "origin", "main"])
+    else:
+        print(result.stderr)
+
+
 def main():
     message = sys.argv[1] if len(sys.argv) > 1 else "Update app"
 
     run(["git", "add", "."])
-    run(["git", "commit", "-m", message])
-    run(["git", "push"])
+
+    print("$ git commit -m ...")
+    result = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(result.stderr)
+        print("(This is fine if it just says 'nothing to commit' — continuing to push.)")
+
+    push()
 
     print("\n✅ Pushed successfully. Streamlit Cloud should redeploy in about a minute.")
 
