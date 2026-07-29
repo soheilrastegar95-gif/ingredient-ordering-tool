@@ -546,61 +546,83 @@ if page == "1. Setup":
 
                         st.divider()
                         st.write(f"**What goes into one batch ({prep['batch_yield_qty']} {prep['unit']}):**")
+                        st.caption("Add as many rows as you need. Use the **+** at the bottom of the table to add "
+                                   "a row, pick the ingredient, and type how much goes into one batch. "
+                                   "Click the bin icon on a row to remove it. Then press Save.")
+
+                        comp_options = [i["name"] for i in all_ings if i["id"] != prep["id"]]
+                        unit_by_name = {i["name"]: i["unit"] for i in all_ings}
+
                         if components:
-                            for comp in components:
-                                cc1, cc2, cc3 = st.columns([3, 1, 1])
-                                cc1.write(comp["component_name"])
-                                cc2.write(f"{comp['qty_per_batch']} {comp['unit']}")
-                                with cc3.popover("⋯"):
-                                    new_cqty = st.number_input(
-                                        f"Amount per batch ({comp['unit']})", min_value=0.0, step=0.1,
-                                        value=float(comp["qty_per_batch"]),
-                                        key=f"pcq_{prep['id']}_{comp['component_ingredient_id']}",
-                                    )
-                                    if st.button("💾 Save", key=f"pcsave_{prep['id']}_{comp['component_ingredient_id']}"):
-                                        db.upsert_prep_component(prep["id"], comp["component_ingredient_id"], new_cqty)
-                                        db.log_activity(LOCATION_ID, "Edited prep recipe",
-                                                        f"{prep['name']}: {comp['component_name']} → {new_cqty} {comp['unit']}")
-                                        st.rerun()
-                                    st.divider()
-                                    confirm_delete(
-                                        f"prepcomp_{prep['id']}_{comp['component_ingredient_id']}",
-                                        comp["component_name"],
-                                        lambda pid=prep["id"], cid=comp["component_ingredient_id"],
-                                               pname=prep["name"], cname=comp["component_name"]: (
-                                            db.remove_prep_component(pid, cid),
-                                            db.log_activity(LOCATION_ID, "Removed component from prep item",
-                                                            f"{pname}: {cname}"),
+                            comp_df = pd.DataFrame([{
+                                "ingredient": c["component_name"],
+                                "qty_per_batch": float(c["qty_per_batch"]),
+                                "unit": c["unit"],
+                            } for c in components])
+                        else:
+                            comp_df = pd.DataFrame({
+                                "ingredient": pd.Series(dtype="str"),
+                                "qty_per_batch": pd.Series(dtype="float"),
+                                "unit": pd.Series(dtype="str"),
+                            })
+
+                        edited_comps = st.data_editor(
+                            comp_df,
+                            num_rows="dynamic",
+                            hide_index=True,
+                            use_container_width=True,
+                            key=f"prep_editor_{prep['id']}",
+                            column_config={
+                                "ingredient": st.column_config.SelectboxColumn(
+                                    "Ingredient", options=comp_options, required=True, width="medium",
+                                ),
+                                "qty_per_batch": st.column_config.NumberColumn(
+                                    "Amount per batch", min_value=0.0, step=0.1, required=True, width="small",
+                                ),
+                                "unit": st.column_config.TextColumn(
+                                    "Unit", disabled=True, width="small",
+                                    help="Filled in automatically from the ingredient after saving.",
+                                ),
+                            },
+                        )
+
+                        if st.button("💾 Save components", key=f"prep_save_comps_{prep['id']}", type="primary"):
+                            pairs, problems, seen_names = [], [], set()
+                            for _, row in edited_comps.iterrows():
+                                cname = row.get("ingredient")
+                                qty = row.get("qty_per_batch")
+                                if cname is None or (isinstance(cname, float) and pd.isna(cname)) or str(cname).strip() == "":
+                                    continue
+                                cname = str(cname).strip()
+                                if pd.isna(qty) or float(qty) <= 0:
+                                    problems.append(f"'{cname}' needs an amount greater than 0.")
+                                    continue
+                                if cname in seen_names:
+                                    problems.append(f"'{cname}' is listed more than once — combine it into one row.")
+                                    continue
+                                match = next((i for i in all_ings if i["name"] == cname), None)
+                                if match is None:
+                                    problems.append(f"'{cname}' isn't a known ingredient.")
+                                    continue
+                                seen_names.add(cname)
+                                pairs.append((match["id"], float(qty)))
+
+                            if problems:
+                                st.error(" ".join(problems))
+                            else:
+                                try:
+                                    db.set_prep_recipe(prep["id"], pairs)
+                                    db.log_activity(
+                                        LOCATION_ID, "Updated prep recipe",
+                                        f"{prep['name']}: " + ", ".join(
+                                            f"{n} {q}{unit_by_name.get(n, '')}"
+                                            for n, q in zip(seen_names, [p[1] for p in pairs])
                                         ),
                                     )
-                        else:
-                            st.caption("No components yet — add the first one below.")
-
-                        used_ids = {c["component_ingredient_id"] for c in components}
-                        available_comps = [i for i in all_ings
-                                            if i["id"] not in used_ids and i["id"] != prep["id"]]
-                        if available_comps:
-                            ac1, ac2, ac3 = st.columns([3, 2, 1])
-                            comp_name = ac1.selectbox(
-                                "Component", [i["name"] for i in available_comps],
-                                key=f"pcpick_{prep['id']}", label_visibility="collapsed",
-                            )
-                            comp = next(i for i in available_comps if i["name"] == comp_name)
-                            comp_qty = ac2.number_input(
-                                f"Amount per batch ({comp['unit']})", min_value=0.0, step=0.1,
-                                key=f"pcaddqty_{prep['id']}",
-                            )
-                            if ac3.button("Add", key=f"pcadd_{prep['id']}"):
-                                if comp_qty <= 0:
-                                    st.error("Enter an amount greater than 0.")
-                                else:
-                                    try:
-                                        db.upsert_prep_component(prep["id"], comp["id"], comp_qty)
-                                        db.log_activity(LOCATION_ID, "Added component to prep item",
-                                                        f"{prep['name']}: {comp_name} ({comp_qty} {comp['unit']})")
-                                        st.rerun()
-                                    except ValueError as e:
-                                        st.error(str(e))
+                                    st.success(f"Saved {len(pairs)} component(s).")
+                                    st.rerun()
+                                except ValueError as e:
+                                    st.error(str(e))
 
                         if prep["consumption_mode"] == "stock" and components:
                             st.divider()
@@ -638,7 +660,7 @@ if page == "1. Setup":
                    "After a delivery, edit the stock numbers in this file and re-upload it below — "
                    "matching ingredients get updated in place, nothing gets duplicated.")
 
-        exp_col1, exp_col2 = st.columns(2)
+        exp_col1, exp_col2, exp_col3 = st.columns(3)
         with exp_col1:
             export_ingredients = db.list_ingredients(LOCATION_ID)
             if export_ingredients:
@@ -673,6 +695,37 @@ if page == "1. Setup":
                 )
             else:
                 st.caption("No recipes yet to export.")
+
+        with exp_col3:
+            export_preps = db.list_prep_ingredients(LOCATION_ID)
+            prep_rows = []
+            for p in export_preps:
+                comps = db.get_prep_recipe(p["id"])
+                if comps:
+                    for c in comps:
+                        prep_rows.append({
+                            "prep_item": p["name"], "unit": p["unit"],
+                            "batch_yield_qty": p["batch_yield_qty"],
+                            "consumption_mode": p["consumption_mode"],
+                            "component": c["component_name"],
+                            "qty_per_batch": c["qty_per_batch"],
+                        })
+                else:
+                    prep_rows.append({
+                        "prep_item": p["name"], "unit": p["unit"],
+                        "batch_yield_qty": p["batch_yield_qty"],
+                        "consumption_mode": p["consumption_mode"],
+                        "component": "", "qty_per_batch": "",
+                    })
+            if prep_rows:
+                export_prep_df = pd.DataFrame(prep_rows)
+                st.download_button(
+                    "⬇️ Export prep items", export_prep_df.to_csv(index=False),
+                    file_name="prep_items_export.csv", key="export_prep_btn",
+                    on_click=lambda: db.log_activity(LOCATION_ID, "Exported prep items CSV", f"{len(prep_rows)} row(s)", snapshot=False),
+                )
+            else:
+                st.caption("No prep items yet to export.")
 
         st.divider()
         st.subheader("Import / update ingredients")
@@ -766,6 +819,95 @@ if page == "1. Setup":
                         db.log_activity(LOCATION_ID, "Uploaded recipes CSV", f"{recipe_file.name}: {added} line(s)")
                         if errors:
                             st.warning("\n".join(errors))
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Couldn't read that CSV: {e}")
+
+        st.divider()
+        st.subheader("Import / update prep items")
+        st.caption("CSV columns: prep_item, unit, batch_yield_qty, consumption_mode, component, qty_per_batch. "
+                   "One row per component — repeat the prep_item name across its rows. "
+                   "consumption_mode is either `stock` or `explode`. Re-importing replaces that "
+                   "prep item's component list.")
+
+        sample_prep_csv = (
+            "prep_item,unit,batch_yield_qty,consumption_mode,component,qty_per_batch\n"
+            "Pizza Sauce,g,2000,stock,Tomatoes,1500\n"
+            "Pizza Sauce,g,2000,stock,Olive Oil,100\n"
+            "Pizza Sauce,g,2000,stock,Garlic,50\n"
+        )
+        st.download_button("Download template", sample_prep_csv, file_name="prep_items_template.csv", key="prep_template_dl")
+
+        prep_file = st.file_uploader("Upload prep items CSV", type="csv", key="prep_csv")
+        if prep_file is not None:
+            try:
+                df = pd.read_csv(prep_file)
+                df.columns = [c.strip().lower() for c in df.columns]
+                required = {"prep_item", "batch_yield_qty", "component", "qty_per_batch"}
+                if not required.issubset(set(df.columns)):
+                    st.error(f"CSV must have columns: prep_item, unit, batch_yield_qty, consumption_mode, component, qty_per_batch")
+                else:
+                    st.write("**Review before importing:**")
+                    st.dataframe(df, use_container_width=True, height=250)
+
+                    if st.button("Import prep items", key="import_prep_btn"):
+                        grouped, errors = {}, []
+                        for _, row in df.iterrows():
+                            pname = str(row["prep_item"]).strip()
+                            if not pname or pname.lower() == "nan":
+                                continue
+                            if pname not in grouped:
+                                mode = str(row.get("consumption_mode", "stock") or "stock").strip().lower()
+                                if mode not in ("stock", "explode"):
+                                    mode = "stock"
+                                grouped[pname] = {
+                                    "unit": str(row.get("unit", "g") or "g").strip(),
+                                    "yield": float(row.get("batch_yield_qty", 0) or 0),
+                                    "mode": mode,
+                                    "components": [],
+                                }
+                            cname = row.get("component")
+                            cqty = row.get("qty_per_batch")
+                            if cname is None or pd.isna(cname) or str(cname).strip() == "":
+                                continue
+                            if pd.isna(cqty) or float(cqty) <= 0:
+                                errors.append(f"{pname}: '{cname}' has no valid amount — skipped.")
+                                continue
+                            grouped[pname]["components"].append((str(cname).strip(), float(cqty)))
+
+                        created, updated = 0, 0
+                        for pname, info in grouped.items():
+                            if info["yield"] <= 0:
+                                errors.append(f"'{pname}' has no batch yield above 0 — skipped.")
+                                continue
+                            prep_ing = db.find_ingredient_by_name(LOCATION_ID, pname)
+                            if prep_ing is None:
+                                db.add_ingredient(LOCATION_ID, pname, info["unit"])
+                                prep_ing = db.find_ingredient_by_name(LOCATION_ID, pname)
+                                created += 1
+                            else:
+                                updated += 1
+                            db.set_prep_settings(prep_ing["id"], True, info["yield"], info["mode"])
+
+                            pairs = []
+                            for cname, cqty in info["components"]:
+                                comp = db.find_ingredient_by_name(LOCATION_ID, cname)
+                                if comp is None:
+                                    errors.append(f"{pname}: ingredient '{cname}' not found — skipped. Add it first.")
+                                    continue
+                                pairs.append((comp["id"], cqty))
+                            try:
+                                db.set_prep_recipe(prep_ing["id"], pairs)
+                            except ValueError as e:
+                                errors.append(f"{pname}: {e}")
+
+                        st.success(f"Created {created} new prep item(s), updated {updated} existing one(s).")
+                        db.log_activity(
+                            LOCATION_ID, "Uploaded prep items CSV",
+                            f"{prep_file.name}: created {created}, updated {updated}",
+                        )
+                        if errors:
+                            st.warning("\n\n".join(errors))
                         st.rerun()
             except Exception as e:
                 st.error(f"Couldn't read that CSV: {e}")

@@ -632,6 +632,27 @@ def upsert_prep_component(prep_ingredient_id: int, component_ingredient_id: int,
     conn.close()
 
 
+def set_prep_recipe(prep_ingredient_id: int, component_qty_pairs: list[tuple[int, float]]):
+    """
+    Replaces the full component list for a prep item in one call.
+    component_qty_pairs = [(component_ingredient_id, qty_per_batch), ...]
+    """
+    for component_id, _ in component_qty_pairs:
+        if would_create_cycle(prep_ingredient_id, component_id):
+            raise ValueError("That would make this prep item contain itself.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM prep_recipe_items WHERE prep_ingredient_id = %s", (prep_ingredient_id,))
+    cur.executemany(
+        "INSERT INTO prep_recipe_items (prep_ingredient_id, component_ingredient_id, qty_per_batch) "
+        "VALUES (%s, %s, %s)",
+        [(prep_ingredient_id, cid, qty) for cid, qty in component_qty_pairs],
+    )
+    conn.commit()
+    conn.close()
+
+
 def remove_prep_component(prep_ingredient_id: int, component_ingredient_id: int):
     conn = get_connection()
     cur = conn.cursor()
