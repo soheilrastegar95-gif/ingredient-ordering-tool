@@ -109,7 +109,14 @@ def record_sales(location_id: int, date: str, sales: dict[str, int]):
     conn.close()
 
 
-def calculate_usage_for_date(location_id: int, date: str) -> dict[str, float]:
+def calculate_usage_for_date(location_id: int, date: str, explode: bool = True) -> dict[str, float]:
+    """
+    Ingredient usage for a date's sales.
+
+    When explode=True (default), any prep item set to 'explode' mode is replaced
+    by its raw components, scaled by how much of a batch was used. Prep items in
+    'stock' mode are left as-is, since their own stock is what gets deducted.
+    """
     the_date = _to_date(date)
     conn = get_connection()
     cur = conn.cursor()
@@ -127,7 +134,46 @@ def calculate_usage_for_date(location_id: int, date: str) -> dict[str, float]:
     )
     rows = cur.fetchall()
     conn.close()
-    return {row["ingredient_name"]: float(row["qty_used"]) for row in rows}
+    usage = {row["ingredient_name"]: float(row["qty_used"]) for row in rows}
+    return explode_usage(location_id, usage) if explode else usage
+
+
+def explode_usage(location_id: int, usage: dict[str, float], max_depth: int = 10) -> dict[str, float]:
+    """
+    Replaces any 'explode'-mode prep item in a usage dict with its raw components.
+
+    component_used = (prep_used / batch_yield) * qty_per_batch
+
+    Runs repeatedly so a prep item made from another prep item resolves all the
+    way down to raw ingredients. max_depth is a safety stop.
+    """
+    prep_map = {}
+    for prep in list_prep_ingredients(location_id):
+        if prep["consumption_mode"] != "explode" or not prep["batch_yield_qty"]:
+            continue
+        prep_map[prep["name"]] = {
+            "yield": float(prep["batch_yield_qty"]),
+            "components": [
+                (c["component_name"], float(c["qty_per_batch"]))
+                for c in get_prep_recipe(prep["id"])
+            ],
+        }
+
+    if not prep_map:
+        return usage
+
+    result = dict(usage)
+    for _ in range(max_depth):
+        to_expand = [name for name in result if name in prep_map]
+        if not to_expand:
+            break
+        for name in to_expand:
+            qty_used = result.pop(name)
+            prep = prep_map[name]
+            batches_used = qty_used / prep["yield"]
+            for component_name, qty_per_batch in prep["components"]:
+                result[component_name] = result.get(component_name, 0) + batches_used * qty_per_batch
+    return result
 
 
 def apply_usage_to_stock(location_id: int, usage: dict[str, float]):
@@ -503,6 +549,126 @@ def get_activity_log(location_id: int, limit: int = 300) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Prep items — ingredients made in-house that have their own recipe
+# ---------------------------------------------------------------------------
+
+def list_prep_ingredients(location_id: int) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM ingredients WHERE location_id = %s AND is_prep = TRUE ORDER BY name",
+        (location_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_prep_settings(ingredient_id: int, is_prep: bool, batch_yield_qty: float = 0,
+                       consumption_mode: str = "stock"):
+    """Turns an ingredient into a prep item (or back into a normal one)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE ingredients SET is_prep = %s, batch_yield_qty = %s, consumption_mode = %s WHERE id = %s",
+        (is_prep, batch_yield_qty, consumption_mode, ingredient_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_prep_recipe(prep_ingredient_id: int) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT pri.component_ingredient_id, i.name AS component_name, i.unit,
+                  pri.qty_per_batch
+           FROM prep_recipe_items pri
+           JOIN ingredients i ON i.id = pri.component_ingredient_id
+           WHERE pri.prep_ingredient_id = %s
+           ORDER BY i.name""",
+        (prep_ingredient_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def would_create_cycle(prep_ingredient_id: int, component_ingredient_id: int) -> bool:
+    """
+    True if adding this component would make a prep item contain itself
+    (directly or through a chain), which would loop forever when calculating.
+    """
+    if prep_ingredient_id == component_ingredient_id:
+        return True
+    seen = set()
+    stack = [component_ingredient_id]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == prep_ingredient_id:
+            return True
+        for item in get_prep_recipe(current):
+            stack.append(item["component_ingredient_id"])
+    return False
+
+
+def upsert_prep_component(prep_ingredient_id: int, component_ingredient_id: int, qty_per_batch: float):
+    if would_create_cycle(prep_ingredient_id, component_ingredient_id):
+        raise ValueError("That would make this prep item contain itself.")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO prep_recipe_items (prep_ingredient_id, component_ingredient_id, qty_per_batch)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (prep_ingredient_id, component_ingredient_id)
+           DO UPDATE SET qty_per_batch = EXCLUDED.qty_per_batch""",
+        (prep_ingredient_id, component_ingredient_id, qty_per_batch),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_prep_component(prep_ingredient_id: int, component_ingredient_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM prep_recipe_items WHERE prep_ingredient_id = %s AND component_ingredient_id = %s",
+        (prep_ingredient_id, component_ingredient_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def produce_batch(location_id: int, prep_ingredient_id: int, batches: float = 1):
+    """
+    Records making N batches of a prep item: deducts the components from stock
+    and adds the yielded quantity to the prep item's own stock.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, batch_yield_qty FROM ingredients WHERE id = %s", (prep_ingredient_id,))
+    prep = cur.fetchone()
+    if prep is None:
+        conn.close()
+        raise ValueError("Prep item not found.")
+
+    for item in get_prep_recipe(prep_ingredient_id):
+        cur.execute(
+            "UPDATE ingredients SET current_stock = current_stock - %s WHERE id = %s",
+            (item["qty_per_batch"] * batches, item["component_ingredient_id"]),
+        )
+    cur.execute(
+        "UPDATE ingredients SET current_stock = current_stock + %s WHERE id = %s",
+        (float(prep["batch_yield_qty"]) * batches, prep_ingredient_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_order_report(location_id: int) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()
@@ -511,6 +677,7 @@ def get_order_report(location_id: int) -> list[dict]:
         SELECT name, unit, current_stock, reorder_threshold, par_level, supplier
         FROM ingredients
         WHERE location_id = %s
+          AND NOT (is_prep = TRUE AND consumption_mode = 'explode')
         ORDER BY supplier, name
         """,
         (location_id,),

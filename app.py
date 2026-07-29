@@ -237,7 +237,9 @@ page = st.sidebar.radio("Go to", ["1. Setup", "2. Daily Entry", "3. Order Report
 # PAGE 1 — SETUP: add your own ingredients, dishes, recipes, or bulk import
 # =============================================================================
 if page == "1. Setup":
-    tab_ing, tab_dish, tab_import = st.tabs(["Ingredients", "Dishes", "Import / Export CSV"])
+    tab_ing, tab_dish, tab_prep, tab_import = st.tabs(
+        ["Ingredients", "Dishes", "Prep Items", "Import / Export CSV"]
+    )
 
     # --- Ingredients tab ---
     with tab_ing:
@@ -474,6 +476,160 @@ if page == "1. Setup":
                             db.log_activity(LOCATION_ID, "Deleted dish", dname),
                         ),
                     )
+
+    # --- Prep Items tab: ingredients you make in-house from other ingredients ---
+    with tab_prep:
+        st.subheader("Prep items")
+        st.caption("A prep item is something you make rather than buy — pizza sauce, dough, dressing. "
+                   "It has its own recipe, but behaves like a normal ingredient inside a dish "
+                   "(e.g. 100g of sauce per pizza).")
+
+        all_ings = db.list_ingredients(LOCATION_ID)
+        if not all_ings:
+            st.warning("Add some ingredients first on the Ingredients tab.")
+        else:
+            prep_items = [i for i in all_ings if i.get("is_prep")]
+            non_prep = [i for i in all_ings if not i.get("is_prep")]
+
+            with st.expander("➕ Turn an ingredient into a prep item"):
+                if not non_prep:
+                    st.caption("Every ingredient is already a prep item.")
+                else:
+                    p1, p2, p3 = st.columns([2, 1, 1])
+                    new_prep_name = p1.selectbox("Ingredient", [i["name"] for i in non_prep], key="new_prep_pick")
+                    new_prep = next(i for i in non_prep if i["name"] == new_prep_name)
+                    batch_yield = p2.number_input(
+                        f"One batch makes ({new_prep['unit']})", min_value=0.0, step=1.0, key="new_prep_yield",
+                    )
+                    mode_label = p3.selectbox(
+                        "Stock tracking", ["Track batches", "Use raw components"], key="new_prep_mode",
+                    )
+                    if st.button("Make it a prep item", key="make_prep_btn"):
+                        if batch_yield <= 0:
+                            st.error("Batch yield must be greater than 0.")
+                        else:
+                            mode = "stock" if mode_label == "Track batches" else "explode"
+                            db.set_prep_settings(new_prep["id"], True, batch_yield, mode)
+                            db.log_activity(LOCATION_ID, "Created prep item",
+                                            f"{new_prep_name} (batch = {batch_yield} {new_prep['unit']}, {mode})")
+                            st.rerun()
+                    st.caption("**Track batches** — you make sauce ahead of time and want to know how much "
+                               "sauce is in the fridge. **Use raw components** — no separate sauce stock; "
+                               "selling a pizza deducts tomatoes, oil and garlic directly.")
+
+            if not prep_items:
+                st.info("No prep items yet — use the section above to create your first one.")
+            else:
+                for prep in prep_items:
+                    components = db.get_prep_recipe(prep["id"])
+                    mode_txt = "tracked as stock" if prep["consumption_mode"] == "stock" else "uses raw components"
+                    label = (f"🧪 {prep['name']} — 1 batch = {prep['batch_yield_qty']} {prep['unit']} "
+                             f"({len(components)} component{'s' if len(components) != 1 else ''}, {mode_txt})")
+
+                    with st.expander(label):
+                        s1, s2, s3 = st.columns([1, 1, 1])
+                        edit_yield = s1.number_input(
+                            f"One batch makes ({prep['unit']})", min_value=0.0, step=1.0,
+                            value=float(prep["batch_yield_qty"]), key=f"pyield_{prep['id']}",
+                        )
+                        edit_mode_label = s2.selectbox(
+                            "Stock tracking", ["Track batches", "Use raw components"],
+                            index=0 if prep["consumption_mode"] == "stock" else 1,
+                            key=f"pmode_{prep['id']}",
+                        )
+                        if s3.button("💾 Save settings", key=f"psave_{prep['id']}"):
+                            mode = "stock" if edit_mode_label == "Track batches" else "explode"
+                            db.set_prep_settings(prep["id"], True, edit_yield, mode)
+                            db.log_activity(LOCATION_ID, "Edited prep item settings",
+                                            f"{prep['name']}: batch = {edit_yield} {prep['unit']}, {mode}")
+                            st.rerun()
+
+                        st.divider()
+                        st.write(f"**What goes into one batch ({prep['batch_yield_qty']} {prep['unit']}):**")
+                        if components:
+                            for comp in components:
+                                cc1, cc2, cc3 = st.columns([3, 1, 1])
+                                cc1.write(comp["component_name"])
+                                cc2.write(f"{comp['qty_per_batch']} {comp['unit']}")
+                                with cc3.popover("⋯"):
+                                    new_cqty = st.number_input(
+                                        f"Amount per batch ({comp['unit']})", min_value=0.0, step=0.1,
+                                        value=float(comp["qty_per_batch"]),
+                                        key=f"pcq_{prep['id']}_{comp['component_ingredient_id']}",
+                                    )
+                                    if st.button("💾 Save", key=f"pcsave_{prep['id']}_{comp['component_ingredient_id']}"):
+                                        db.upsert_prep_component(prep["id"], comp["component_ingredient_id"], new_cqty)
+                                        db.log_activity(LOCATION_ID, "Edited prep recipe",
+                                                        f"{prep['name']}: {comp['component_name']} → {new_cqty} {comp['unit']}")
+                                        st.rerun()
+                                    st.divider()
+                                    confirm_delete(
+                                        f"prepcomp_{prep['id']}_{comp['component_ingredient_id']}",
+                                        comp["component_name"],
+                                        lambda pid=prep["id"], cid=comp["component_ingredient_id"],
+                                               pname=prep["name"], cname=comp["component_name"]: (
+                                            db.remove_prep_component(pid, cid),
+                                            db.log_activity(LOCATION_ID, "Removed component from prep item",
+                                                            f"{pname}: {cname}"),
+                                        ),
+                                    )
+                        else:
+                            st.caption("No components yet — add the first one below.")
+
+                        used_ids = {c["component_ingredient_id"] for c in components}
+                        available_comps = [i for i in all_ings
+                                            if i["id"] not in used_ids and i["id"] != prep["id"]]
+                        if available_comps:
+                            ac1, ac2, ac3 = st.columns([3, 2, 1])
+                            comp_name = ac1.selectbox(
+                                "Component", [i["name"] for i in available_comps],
+                                key=f"pcpick_{prep['id']}", label_visibility="collapsed",
+                            )
+                            comp = next(i for i in available_comps if i["name"] == comp_name)
+                            comp_qty = ac2.number_input(
+                                f"Amount per batch ({comp['unit']})", min_value=0.0, step=0.1,
+                                key=f"pcaddqty_{prep['id']}",
+                            )
+                            if ac3.button("Add", key=f"pcadd_{prep['id']}"):
+                                if comp_qty <= 0:
+                                    st.error("Enter an amount greater than 0.")
+                                else:
+                                    try:
+                                        db.upsert_prep_component(prep["id"], comp["id"], comp_qty)
+                                        db.log_activity(LOCATION_ID, "Added component to prep item",
+                                                        f"{prep['name']}: {comp_name} ({comp_qty} {comp['unit']})")
+                                        st.rerun()
+                                    except ValueError as e:
+                                        st.error(str(e))
+
+                        if prep["consumption_mode"] == "stock" and components:
+                            st.divider()
+                            st.write("**Made a batch?**")
+                            b1, b2 = st.columns([2, 1])
+                            n_batches = b1.number_input(
+                                "How many batches", min_value=0.0, step=0.5, value=1.0,
+                                key=f"pbatch_{prep['id']}",
+                            )
+                            if b2.button("Record production", key=f"pprod_{prep['id']}", type="primary"):
+                                if n_batches <= 0:
+                                    st.error("Enter a number greater than 0.")
+                                else:
+                                    db.produce_batch(LOCATION_ID, prep["id"], n_batches)
+                                    db.log_activity(
+                                        LOCATION_ID, "Produced prep batch",
+                                        f"{prep['name']}: {n_batches} batch(es) "
+                                        f"= {n_batches * float(prep['batch_yield_qty'])} {prep['unit']}",
+                                    )
+                                    st.success("Components deducted, stock added.")
+                                    st.rerun()
+                            st.caption("This deducts the components from stock and adds the finished "
+                                       "quantity to this item's stock.")
+
+                        st.divider()
+                        if st.button("Convert back to a normal ingredient", key=f"punprep_{prep['id']}"):
+                            db.set_prep_settings(prep["id"], False, 0, "stock")
+                            db.log_activity(LOCATION_ID, "Converted prep item to normal ingredient", prep["name"])
+                            st.rerun()
 
     # --- Import tab: bulk-add ingredients and recipes via CSV ---
     with tab_import:
